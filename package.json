@@ -1,13 +1,15 @@
 {
   "name": "egghaven-ws",
-  "version": "1.1.0",
+  "version": "2.13.6",
+  "description": "EggHaven WebSocket server (with optional Postgres persistence)",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "pg": "^8.13.0",
-    "ws": "^8.18.0"
+    "dotenv": "^16.4.5",
+    "pg": "^8.11.5",
+    "ws": "^8.17.1"
   }
 }
