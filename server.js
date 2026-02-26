@@ -1,304 +1,240 @@
-import 'dotenv/config';
-import http from 'http';
-import { WebSocketServer } from 'ws';
-import pg from 'pg';
+import "dotenv/config";
+import http from "http";
+import crypto from "crypto";
+import { WebSocketServer } from "ws";
+import pg from "pg";
 
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
-const DATABASE_URL = process.env.DATABASE_URL || '';
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
+const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
   .map(s => s.trim())
   .filter(Boolean);
 
-// ----- Simple in-memory state (always used), DB-backed for drops when DATABASE_URL exists -----
-// rooms: Map<roomKey, { players: Map<clientId, Player>, drops: Map<dropId, Drop> }>
-const rooms = new Map();
-let nextClientId = 1;
-
-function roomKeyFrom(msgRoom) {
-  // client sends either room: "5600" or roomKey:"yourfarm_xxx" (private)
-  if (msgRoom === undefined || msgRoom === null) return '0';
-  return String(msgRoom);
-}
-
-function getRoom(key) {
-  let r = rooms.get(key);
-  if (!r) {
-    r = { players: new Map(), drops: new Map() };
-    rooms.set(key, r);
-  }
-  return r;
-}
-
-// ----- Database (optional) -----
 const { Pool } = pg;
+
+function shouldUseSsl(connectionString) {
+  // Hvis du en dag bruger en URL med sslmode=require, så tænder vi SSL.
+  return /sslmode=require/i.test(connectionString);
+}
+
 const pool = DATABASE_URL
   ? new Pool({
       connectionString: DATABASE_URL,
-      ssl:
-        DATABASE_URL.includes('render.com') || DATABASE_URL.includes('supabase')
-          ? { rejectUnauthorized: false }
-          : undefined
+      ssl: shouldUseSsl(DATABASE_URL) ? { rejectUnauthorized: false } : false
     })
   : null;
 
+// -------- In-memory fallback (bruges altid, DB bruges kun til drops hvis sat) --------
+const clients = new Map(); // ws -> { id, name, room, x, y }
+const rooms = new Map();   // room -> Set(ws)
+const dropsMem = new Map(); // room -> Map(dropId -> drop)
+
+function rid() {
+  return crypto.randomBytes(8).toString("hex");
+}
+function safeName(s) {
+  const t = String(s ?? "").trim().slice(0, 18);
+  return t || "Player";
+}
+function roomKey(msgRoom) {
+  if (msgRoom === undefined || msgRoom === null) return "Lobby";
+  return String(msgRoom).slice(0, 40) || "Lobby";
+}
+function getRoomSet(room) {
+  if (!rooms.has(room)) rooms.set(room, new Set());
+  return rooms.get(room);
+}
+function getRoomDrops(room) {
+  if (!dropsMem.has(room)) dropsMem.set(room, new Map());
+  return dropsMem.get(room);
+}
+function broadcast(room, obj) {
+  const set = rooms.get(room);
+  if (!set) return;
+  const msg = JSON.stringify(obj);
+  for (const ws of set) {
+    if (ws.readyState === ws.OPEN) ws.send(msg);
+  }
+}
+function snapshot(room) {
+  const set = rooms.get(room) ?? new Set();
+  const players = [];
+  for (const ws of set) {
+    const p = clients.get(ws);
+    if (p) players.push({ id: p.id, name: p.name, x: p.x, y: p.y });
+  }
+  const roomDrops = [...getRoomDrops(room).values()];
+  return { players, drops: roomDrops };
+}
+
+// -------- DB: kun drops persistence --------
 async function dbInit() {
   if (!pool) return;
   await pool.query(`
-    create table if not exists egghaven_drops(
-      room_key text not null,
-      drop_id text primary key,
-      item_type text not null,
-      x int not null,
-      y int not null,
-      skin text,
-      created_at timestamptz not null default now()
+    CREATE TABLE IF NOT EXISTS room_drops (
+      room      TEXT NOT NULL,
+      drop_id   TEXT PRIMARY KEY,
+      item_type TEXT NOT NULL,
+      x         INTEGER NOT NULL,
+      y         INTEGER NOT NULL,
+      payload   JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-  await pool.query(
-    `create index if not exists egghaven_drops_room_idx on egghaven_drops(room_key);`
-  );
 }
 
-async function dbLoadRoomDrops(room_key) {
+async function dbLoadDrops(room) {
   if (!pool) return [];
   const res = await pool.query(
-    `select drop_id, item_type, x, y, skin from egghaven_drops where room_key=$1`,
-    [room_key]
+    `SELECT payload FROM room_drops WHERE room = $1 ORDER BY created_at ASC`,
+    [room]
   );
-  return res.rows.map(r => ({
-    id: r.drop_id,
-    itemType: r.item_type,
-    x: r.x,
-    y: r.y,
-    skin: r.skin || null
-  }));
+  return res.rows.map(r => r.payload);
 }
 
-async function dbUpsertDrop(room_key, drop) {
+async function dbInsertDrop(room, drop) {
   if (!pool) return;
   await pool.query(
-    `insert into egghaven_drops(room_key, drop_id, item_type, x, y, skin)
-     values($1,$2,$3,$4,$5,$6)
-     on conflict(drop_id) do update set
-       room_key=excluded.room_key,
-       item_type=excluded.item_type,
-       x=excluded.x,
-       y=excluded.y,
-       skin=excluded.skin`,
-    [room_key, drop.id, drop.itemType, drop.x, drop.y, drop.skin || null]
+    `INSERT INTO room_drops(room, drop_id, item_type, x, y, payload)
+     VALUES($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (drop_id) DO NOTHING`,
+    [room, drop.dropId, drop.itemType, drop.x, drop.y, drop]
   );
 }
 
-async function dbDeleteDrop(drop_id) {
+async function dbDeleteDrop(dropId) {
   if (!pool) return;
-  await pool.query(`delete from egghaven_drops where drop_id=$1`, [drop_id]);
+  await pool.query(`DELETE FROM room_drops WHERE drop_id = $1`, [dropId]);
 }
 
-// ----- HTTP server (healthcheck) -----
-const server = http.createServer((req, res) => {
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
-    return;
+// -------- HTTP + WS server --------
+const server = http.createServer(async (req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        db: Boolean(pool),
+        databaseUrlSet: Boolean(DATABASE_URL)
+      })
+    );
   }
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('EggHaven WS server');
+
+  res.writeHead(200, { "content-type": "text/plain" });
+  res.end("EggHaven WS server running");
 });
 
 const wss = new WebSocketServer({ server });
 
-// ----- Helpers -----
-function send(ws, obj) {
-  try {
-    ws.send(JSON.stringify(obj));
-  } catch {}
-}
-
-function broadcast(roomKey, obj) {
-  const room = getRoom(roomKey);
-  for (const player of room.players.values()) {
-    send(player.ws, obj);
-  }
-}
-
-function originAllowed(req) {
-  if (!ALLOWED_ORIGINS.length) return true; // allow all if not specified
-  const origin = req.headers.origin || '';
-  return ALLOWED_ORIGINS.includes(origin);
-}
-
-// ----- WS handling -----
-wss.on('connection', async (ws, req) => {
-  if (!originAllowed(req)) {
-    ws.close(1008, 'Origin not allowed');
+wss.on("connection", (ws, req) => {
+  // (valgfrit) origin check – hvis du får problemer, så lad ALLOWED_ORIGINS være tom
+  const origin = req.headers.origin || "";
+  if (ALLOWED_ORIGINS.length && origin && !ALLOWED_ORIGINS.includes(origin)) {
+    ws.close(1008, "Origin not allowed");
     return;
   }
 
-  const clientId = String(nextClientId++);
-  let currentRoomKey = null;
-
-  ws.on('message', async raw => {
+  ws.on("message", async (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(String(raw)); } catch { return; }
 
-    // expected messages:
-    // {type:"join", room:"5600", name, x,y, skin}
-    // {type:"move", x,y, dir, anim}
-    // {type:"drop_item", room, drop:{id,itemType,x,y,skin}}
-    // {type:"pickup_item", room, dropId}
-    // {type:"chat", text}
-    const type = msg.type;
+    if (msg.t === "join") {
+      const id = rid();
+      const name = safeName(msg.name);
+      const room = roomKey(msg.room);
+      const x = Number.isFinite(msg.x) ? msg.x : 5;
+      const y = Number.isFinite(msg.y) ? msg.y : 5;
 
-    if (type === 'join') {
-      const rk = roomKeyFrom(msg.room ?? msg.roomKey);
-      currentRoomKey = rk;
+      clients.set(ws, { id, name, room, x, y });
+      getRoomSet(room).add(ws);
 
-      const room = getRoom(rk);
-
-      // Load drops from DB once per room (only when room is empty drops map)
-      if (pool && room.drops.size === 0) {
-        try {
-          const dbDrops = await dbLoadRoomDrops(rk);
-          for (const d of dbDrops) room.drops.set(d.id, d);
-        } catch (e) {
-          console.log('dbLoadRoomDrops error', e?.message || e);
-        }
-      }
-
-      room.players.set(clientId, {
-        id: clientId,
-        ws,
-        name: msg.name || 'Player',
-        x: msg.x ?? 0,
-        y: msg.y ?? 0,
-        skin: msg.skin || null
-      });
-
-      // send initial state to this client
-      send(ws, {
-        type: 'state',
-        you: clientId,
-        players: Array.from(room.players.values()).map(p => ({
-          id: p.id,
-          name: p.name,
-          x: p.x,
-          y: p.y,
-          skin: p.skin
-        })),
-        drops: Array.from(room.drops.values())
-      });
-
-      // tell others
-      broadcast(rk, {
-        type: 'player_join',
-        player: {
-          id: clientId,
-          name: msg.name || 'Player',
-          x: msg.x ?? 0,
-          y: msg.y ?? 0,
-          skin: msg.skin || null
-        }
-      });
-
-      return;
-    }
-
-    if (!currentRoomKey) return;
-    const room = getRoom(currentRoomKey);
-
-    if (type === 'move') {
-      const p = room.players.get(clientId);
-      if (!p) return;
-      p.x = msg.x ?? p.x;
-      p.y = msg.y ?? p.y;
-
-      broadcast(currentRoomKey, {
-        type: 'player_move',
-        id: clientId,
-        x: p.x,
-        y: p.y,
-        dir: msg.dir ?? null,
-        anim: msg.anim ?? null
-      });
-      return;
-    }
-
-    if (type === 'chat') {
-      broadcast(currentRoomKey, {
-        type: 'chat',
-        id: clientId,
-        text: String(msg.text || '').slice(0, 200)
-      });
-      return;
-    }
-
-    if (type === 'drop_item') {
-      const rk = roomKeyFrom(msg.room ?? currentRoomKey);
-      const drop = msg.drop;
-      if (!drop || !drop.id) return;
-
-      const room2 = getRoom(rk);
-      room2.drops.set(drop.id, {
-        id: String(drop.id),
-        itemType: String(drop.itemType || 'unknown'),
-        x: Number(drop.x || 0),
-        y: Number(drop.y || 0),
-        skin: drop.skin || null
-      });
-
+      // load drops fra DB (en gang pr join) og merge til memory
       try {
-        await dbUpsertDrop(rk, room2.drops.get(drop.id));
+        const dbDrops = pool ? await dbLoadDrops(room) : [];
+        const m = getRoomDrops(room);
+        for (const d of dbDrops) m.set(d.dropId, d);
       } catch (e) {
-        console.log('dbUpsertDrop error', e?.message || e);
+        // hvis DB fejler, fortsæt bare med in-memory
+        console.error("DB load drops failed:", e?.message || e);
       }
 
-      broadcast(rk, { type: 'drop_added', drop: room2.drops.get(drop.id) });
+      ws.send(JSON.stringify({ t: "welcome", id, room, snapshot: snapshot(room) }));
+      broadcast(room, { t: "player_join", player: { id, name, x, y } });
       return;
     }
 
-    if (type === 'pickup_item') {
-      const rk = roomKeyFrom(msg.room ?? currentRoomKey);
-      const dropId = String(msg.dropId || '');
-      if (!dropId) return;
+    const me = clients.get(ws);
+    if (!me) return;
 
-      const room2 = getRoom(rk);
-      if (!room2.drops.has(dropId)) return;
+    if (msg.t === "move") {
+      me.x = Number.isFinite(msg.x) ? msg.x : me.x;
+      me.y = Number.isFinite(msg.y) ? msg.y : me.y;
+      broadcast(me.room, { t: "player_move", id: me.id, x: me.x, y: me.y });
+      return;
+    }
 
-      room2.drops.delete(dropId);
-      try {
-        await dbDeleteDrop(dropId);
-      } catch (e) {
-        console.log('dbDeleteDrop error', e?.message || e);
+    if (msg.t === "chat") {
+      const text = String(msg.text ?? "").trim().slice(0, 180);
+      if (!text) return;
+      broadcast(me.room, { t: "chat", id: me.id, name: me.name, text });
+      return;
+    }
+
+    if (msg.t === "drop") {
+      const itemType = String(msg.itemType ?? "item").slice(0, 24);
+      const x = Number.isFinite(msg.x) ? msg.x : me.x;
+      const y = Number.isFinite(msg.y) ? msg.y : me.y;
+      const dropId = rid();
+
+      const drop = { dropId, itemType, x, y, by: me.id };
+      getRoomDrops(me.room).set(dropId, drop);
+
+      // persist
+      try { await dbInsertDrop(me.room, drop); } catch (e) {
+        console.error("DB insert drop failed:", e?.message || e);
       }
 
-      broadcast(rk, { type: 'drop_removed', dropId });
+      broadcast(me.room, { t: "drop_spawn", drop });
+      return;
+    }
+
+    if (msg.t === "pickup") {
+      const dropId = String(msg.dropId ?? "");
+      const roomDrops = getRoomDrops(me.room);
+      const drop = roomDrops.get(dropId);
+      if (!drop) return;
+
+      roomDrops.delete(dropId);
+
+      // persist
+      try { await dbDeleteDrop(dropId); } catch (e) {
+        console.error("DB delete drop failed:", e?.message || e);
+      }
+
+      broadcast(me.room, { t: "drop_picked", dropId, by: me.id });
       return;
     }
   });
 
-  ws.on('close', () => {
-    if (!currentRoomKey) return;
-    const room = getRoom(currentRoomKey);
-    room.players.delete(clientId);
-    broadcast(currentRoomKey, { type: 'player_leave', id: clientId });
+  ws.on("close", () => {
+    const me = clients.get(ws);
+    if (!me) return;
+    clients.delete(ws);
+
+    const set = rooms.get(me.room);
+    if (set) {
+      set.delete(ws);
+      if (set.size === 0) rooms.delete(me.room);
+    }
+
+    broadcast(me.room, { t: "player_leave", id: me.id });
   });
 });
 
-// Start
-(async () => {
-  try {
-    await dbInit();
-  } catch (e) {
-    console.log('dbInit error', e?.message || e);
-  }
+await dbInit();
 
-  server.listen(PORT, () => {
-    console.log(`WS server listening on ${PORT}`);
-    console.log(`DATABASE_URL set: ${!!DATABASE_URL}`);
-  });
-})();
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("WS server listening on", PORT);
+  console.log("DATABASE_URL set:", Boolean(DATABASE_URL));
+});
