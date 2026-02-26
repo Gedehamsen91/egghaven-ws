@@ -1,7 +1,6 @@
 {
   "name": "egghaven-ws",
-  "version": "2.13.6",
-  "description": "EggHaven WebSocket server (with optional Postgres persistence)",
+  "version": "2.13.7",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -9,7 +8,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "pg": "^8.11.5",
-    "ws": "^8.17.1"
+    "pg": "^8.12.0",
+    "ws": "^8.18.0"
   }
 }
