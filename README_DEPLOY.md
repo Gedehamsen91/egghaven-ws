@@ -1,19 +1,8 @@
-# EggHaven WS (Render + Postgres)
+## EggHaven WS
 
-## Krav
-- Render Web Service: egghaven-ws
-- Render Postgres: egghaven-db
+### Env vars (Render)
+- DATABASE_URL = <Internal Database URL from egghaven-db>
+- (optional) ALLOWED_ORIGINS = https://tech-champ.dk
 
-## Setup
-1) I Render -> egghaven-db -> Connections
-   Copy "Internal Database URL"
-
-2) I Render -> egghaven-ws -> Environment
-   Add env var:
-   DATABASE_URL = (paste Internal Database URL)
-
-3) Deploy / redeploy.
-
-## Test
-- Åbn: /health
-  Den skal vise {"ok":true,"db":true}
+Health check:
+- /health
